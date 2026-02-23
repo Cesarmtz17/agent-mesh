@@ -1,0 +1,5 @@
+node_modules/
+.env
+agentmesh.db
+agentmesh.db-wal
+agentmesh.db-shm
