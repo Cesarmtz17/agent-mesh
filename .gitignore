@@ -1,5 +1,6 @@
 node_modules/
 .env
+data.json
 agentmesh.db
 agentmesh.db-wal
 agentmesh.db-shm

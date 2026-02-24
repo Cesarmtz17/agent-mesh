@@ -1,230 +1,217 @@
 require('dotenv').config();
 const express = require('express');
-const Database = require('better-sqlite3');
 const crypto = require('crypto');
+const fs = require('fs');
 const path = require('path');
 
 const app = express();
 app.use(express.json());
 
-// --- Database Setup ---
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'agentmesh.db');
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
+// --- JSON File Database ---
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data.json');
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS rooms (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    api_key TEXT UNIQUE NOT NULL,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
+function loadDB() {
+  try {
+    if (fs.existsSync(DB_PATH)) return JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
+  } catch (e) { console.error('DB load error:', e.message); }
+  return { rooms: [], agents: [], messages: [], tasks: [] };
+}
 
-  CREATE TABLE IF NOT EXISTS agents (
-    id TEXT PRIMARY KEY,
-    room_id TEXT NOT NULL,
-    name TEXT NOT NULL,
-    joined_at TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (room_id) REFERENCES rooms(id)
-  );
+function saveDB(data) {
+  fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2));
+}
 
-  CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    room_id TEXT NOT NULL,
-    from_agent TEXT NOT NULL,
-    to_agent TEXT,
-    content TEXT NOT NULL,
-    type TEXT DEFAULT 'message',
-    read_by TEXT DEFAULT '[]',
-    created_at TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (room_id) REFERENCES rooms(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    room_id TEXT NOT NULL,
-    title TEXT NOT NULL,
-    description TEXT,
-    assigned_to TEXT,
-    status TEXT DEFAULT 'pending',
-    created_by TEXT NOT NULL,
-    created_at TEXT DEFAULT (datetime('now')),
-    updated_at TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (room_id) REFERENCES rooms(id)
-  );
-`);
+// Initialize
+if (!fs.existsSync(DB_PATH)) saveDB({ rooms: [], agents: [], messages: [], tasks: [] });
 
 // --- Auth Middleware ---
 function auth(req, res, next) {
   const apiKey = req.headers['x-api-key'];
   if (!apiKey) return res.status(401).json({ error: 'Missing x-api-key header' });
 
-  const room = db.prepare('SELECT * FROM rooms WHERE api_key = ?').get(apiKey);
+  const db = loadDB();
+  const room = db.rooms.find(r => r.api_key === apiKey);
   if (!room) return res.status(403).json({ error: 'Invalid API key' });
 
   req.room = room;
+  req.db = db;
   next();
 }
 
 // --- Room Routes ---
 
-// Create a new room (no auth needed)
 app.post('/rooms', (req, res) => {
   const { name } = req.body;
   if (!name) return res.status(400).json({ error: 'name is required' });
 
-  const id = crypto.randomUUID();
-  const api_key = 'amesh_' + crypto.randomBytes(24).toString('hex');
+  const db = loadDB();
+  const room = {
+    id: crypto.randomUUID(),
+    name,
+    api_key: 'amesh_' + crypto.randomBytes(24).toString('hex'),
+    created_at: new Date().toISOString()
+  };
 
-  db.prepare('INSERT INTO rooms (id, name, api_key) VALUES (?, ?, ?)').run(id, name, api_key);
+  db.rooms.push(room);
+  saveDB(db);
 
   res.status(201).json({
-    room_id: id,
-    name,
-    api_key,
+    room_id: room.id,
+    name: room.name,
+    api_key: room.api_key,
     message: '⚡ Room created! Share the api_key with your collaborators.'
   });
 });
 
-// Get room info
 app.get('/rooms', auth, (req, res) => {
-  const agents = db.prepare('SELECT id, name, joined_at FROM agents WHERE room_id = ?').all(req.room.id);
-  res.json({ room: { id: req.room.id, name: req.room.name, created_at: req.room.created_at }, agents });
+  const agents = req.db.agents.filter(a => a.room_id === req.room.id);
+  res.json({
+    room: { id: req.room.id, name: req.room.name, created_at: req.room.created_at },
+    agents: agents.map(a => ({ id: a.id, name: a.name, joined_at: a.joined_at }))
+  });
 });
 
 // --- Agent Routes ---
 
-// Join a room
 app.post('/agents', auth, (req, res) => {
   const { name } = req.body;
   if (!name) return res.status(400).json({ error: 'name is required' });
 
-  const id = crypto.randomUUID();
-  const existing = db.prepare('SELECT * FROM agents WHERE room_id = ? AND name = ?').get(req.room.id, name);
+  const db = req.db;
+  const existing = db.agents.find(a => a.room_id === req.room.id && a.name === name);
   if (existing) return res.json({ agent: existing, message: 'Agent already in room' });
 
-  db.prepare('INSERT INTO agents (id, room_id, name) VALUES (?, ?, ?)').run(id, req.room.id, name);
-  res.status(201).json({ agent: { id, name, room_id: req.room.id }, message: `${name} joined the room!` });
+  const agent = {
+    id: crypto.randomUUID(),
+    room_id: req.room.id,
+    name,
+    joined_at: new Date().toISOString()
+  };
+
+  db.agents.push(agent);
+  saveDB(db);
+  res.status(201).json({ agent, message: `${name} joined the room!` });
 });
 
-// List agents in room
 app.get('/agents', auth, (req, res) => {
-  const agents = db.prepare('SELECT id, name, joined_at FROM agents WHERE room_id = ?').all(req.room.id);
-  res.json({ agents });
+  const agents = req.db.agents.filter(a => a.room_id === req.room.id);
+  res.json({ agents: agents.map(a => ({ id: a.id, name: a.name, joined_at: a.joined_at })) });
 });
 
 // --- Message Routes ---
 
-// Send a message
 app.post('/messages', auth, (req, res) => {
   const { from, to, content, type } = req.body;
   if (!from || !content) return res.status(400).json({ error: 'from and content are required' });
 
-  const result = db.prepare(
-    'INSERT INTO messages (room_id, from_agent, to_agent, content, type) VALUES (?, ?, ?, ?, ?)'
-  ).run(req.room.id, from, to || null, content, type || 'message');
+  const db = req.db;
+  const id = (db.messages.length > 0) ? db.messages[db.messages.length - 1].id + 1 : 1;
 
-  res.status(201).json({ id: result.lastInsertRowid, message: 'Message sent' });
+  const msg = {
+    id,
+    room_id: req.room.id,
+    from_agent: from,
+    to_agent: to || null,
+    content,
+    type: type || 'message',
+    read_by: [],
+    created_at: new Date().toISOString()
+  };
+
+  db.messages.push(msg);
+  saveDB(db);
+  res.status(201).json({ id: msg.id, message: 'Message sent' });
 });
 
-// Get messages (with optional filters)
 app.get('/messages', auth, (req, res) => {
   const { for: forAgent, since_id, limit } = req.query;
   const maxLimit = Math.min(parseInt(limit) || 50, 200);
 
-  let query = 'SELECT * FROM messages WHERE room_id = ?';
-  const params = [req.room.id];
+  let messages = req.db.messages.filter(m => m.room_id === req.room.id);
 
   if (forAgent) {
-    query += ' AND (to_agent = ? OR to_agent IS NULL)';
-    params.push(forAgent);
+    messages = messages.filter(m => m.to_agent === forAgent || m.to_agent === null);
   }
 
   if (since_id) {
-    query += ' AND id > ?';
-    params.push(parseInt(since_id));
+    messages = messages.filter(m => m.id > parseInt(since_id));
   }
 
-  query += ' ORDER BY id DESC LIMIT ?';
-  params.push(maxLimit);
-
-  const messages = db.prepare(query).all(...params);
-  res.json({ messages: messages.reverse() });
+  messages = messages.slice(-maxLimit);
+  res.json({ messages });
 });
 
-// Mark messages as read
 app.post('/messages/read', auth, (req, res) => {
   const { agent, up_to_id } = req.body;
   if (!agent || !up_to_id) return res.status(400).json({ error: 'agent and up_to_id required' });
 
-  const messages = db.prepare(
-    'SELECT id, read_by FROM messages WHERE room_id = ? AND id <= ? AND to_agent IS NULL OR to_agent = ?'
-  ).all(req.room.id, up_to_id, agent);
-
-  const update = db.prepare('UPDATE messages SET read_by = ? WHERE id = ?');
+  const db = req.db;
   let count = 0;
 
-  for (const msg of messages) {
-    const readBy = JSON.parse(msg.read_by);
-    if (!readBy.includes(agent)) {
-      readBy.push(agent);
-      update.run(JSON.stringify(readBy), msg.id);
-      count++;
+  for (const msg of db.messages) {
+    if (msg.room_id === req.room.id && msg.id <= up_to_id) {
+      if (msg.to_agent === null || msg.to_agent === agent) {
+        if (!msg.read_by.includes(agent)) {
+          msg.read_by.push(agent);
+          count++;
+        }
+      }
     }
   }
 
+  saveDB(db);
   res.json({ marked: count });
 });
 
 // --- Task Routes ---
 
-// Create a task
 app.post('/tasks', auth, (req, res) => {
   const { title, description, assigned_to, created_by } = req.body;
   if (!title || !created_by) return res.status(400).json({ error: 'title and created_by required' });
 
-  const result = db.prepare(
-    'INSERT INTO tasks (room_id, title, description, assigned_to, created_by) VALUES (?, ?, ?, ?, ?)'
-  ).run(req.room.id, title, description || null, assigned_to || null, created_by);
+  const db = req.db;
+  const id = (db.tasks.length > 0) ? db.tasks[db.tasks.length - 1].id + 1 : 1;
 
-  res.status(201).json({ id: result.lastInsertRowid, message: 'Task created' });
+  const task = {
+    id,
+    room_id: req.room.id,
+    title,
+    description: description || null,
+    assigned_to: assigned_to || null,
+    status: 'pending',
+    created_by,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  };
+
+  db.tasks.push(task);
+  saveDB(db);
+  res.status(201).json({ id: task.id, message: 'Task created' });
 });
 
-// List tasks
 app.get('/tasks', auth, (req, res) => {
   const { status, assigned_to } = req.query;
+  let tasks = req.db.tasks.filter(t => t.room_id === req.room.id);
 
-  let query = 'SELECT * FROM tasks WHERE room_id = ?';
-  const params = [req.room.id];
+  if (status) tasks = tasks.filter(t => t.status === status);
+  if (assigned_to) tasks = tasks.filter(t => t.assigned_to === assigned_to);
 
-  if (status) { query += ' AND status = ?'; params.push(status); }
-  if (assigned_to) { query += ' AND assigned_to = ?'; params.push(assigned_to); }
-
-  query += ' ORDER BY created_at DESC';
-  const tasks = db.prepare(query).all(...params);
-  res.json({ tasks });
+  res.json({ tasks: tasks.reverse() });
 });
 
-// Update a task
 app.patch('/tasks/:id', auth, (req, res) => {
   const { status, assigned_to, title, description } = req.body;
-  const task = db.prepare('SELECT * FROM tasks WHERE id = ? AND room_id = ?').get(req.params.id, req.room.id);
+  const db = req.db;
+  const task = db.tasks.find(t => t.id === parseInt(req.params.id) && t.room_id === req.room.id);
   if (!task) return res.status(404).json({ error: 'Task not found' });
 
-  const updates = [];
-  const params = [];
+  if (status) task.status = status;
+  if (assigned_to) task.assigned_to = assigned_to;
+  if (title) task.title = title;
+  if (description) task.description = description;
+  task.updated_at = new Date().toISOString();
 
-  if (status) { updates.push('status = ?'); params.push(status); }
-  if (assigned_to) { updates.push('assigned_to = ?'); params.push(assigned_to); }
-  if (title) { updates.push('title = ?'); params.push(title); }
-  if (description) { updates.push('description = ?'); params.push(description); }
-
-  if (updates.length === 0) return res.status(400).json({ error: 'Nothing to update' });
-
-  updates.push("updated_at = datetime('now')");
-  params.push(req.params.id, req.room.id);
-
-  db.prepare(`UPDATE tasks SET ${updates.join(', ')} WHERE id = ? AND room_id = ?`).run(...params);
+  saveDB(db);
   res.json({ message: 'Task updated' });
 });
 
